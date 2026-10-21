@@ -1,0 +1,206 @@
+# Builds the Teleport auth image (stock teleport-distroless with teleport
+# rebuilt from upstream v$UPSTREAM_VERSION plus eng/maestra/patches) and pushes
+# it to the PUBLIC ECR. See eng/maestra/README.md.
+#
+# Modeled on maestra-io/eventrouter build-and-push-ecr.yml (public ECR via the
+# image-push Teleport bot) and maestra-io/dotnet-monitor sidecar-image.yml
+# (fresh upstream + patches, --target test). No cron: the upstream tag is
+# pinned in eng/maestra/UPSTREAM_VERSION and Renovate bumps it.
+name: Build and push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - eng/maestra/**
+      - "!eng/maestra/**/*.md"
+      - .github/workflows/build-and-push.yml
+  pull_request:
+    paths:
+      - eng/maestra/**
+      - "!eng/maestra/**/*.md"
+      - .github/workflows/build-and-push.yml
+  workflow_dispatch:
+
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ECR_REGISTRY: public.ecr.aws/g5f9s8a4
+  # ecr-public's API is only callable in us-east-1; the registry is global.
+  AWS_REGION: us-east-1
+  TELEPORT_FQDN: teleport.maestra.io:443
+  # Org-wide token (maestra-io/fluxcd iota/us-iota-lw-kube-infra/teleport-maestra/
+  # operator-crs/image-push-tokens.yaml): any maestra-io repo, refs/heads/main
+  # or master only. A pull_request run cannot join, so it never pushes.
+  TELEPORT_TOKEN: image-push-github-actions-maestra-io
+  AWS_ROLE_ARN: "arn:aws:iam::515260921971:role/teleport-image-push"
+  IMAGE_NAME: teleport-maestra
+
+jobs:
+  build-and-push:
+    # Public repo, self-hosted runners: never run a fork's PR on them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: runs-on=${{ github.run_id }}/pool=build
+    env:
+      DOCKER_BUILDKIT: 1
+    steps:
+      - uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3  # v2.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Check the FROM tag matches UPSTREAM_VERSION
+        id: version
+        run: |
+          set -euo pipefail
+          V=$(cat eng/maestra/UPSTREAM_VERSION)
+          FROM_TAG=$(sed -n 's|^FROM public\.ecr\.aws/gravitational/teleport-distroless:\([^@]*\)@sha256:.*|\1|p' eng/maestra/Dockerfile)
+          if [ "$FROM_TAG" != "$V" ]; then
+            echo "::error file=eng/maestra/Dockerfile::teleport-distroless tag '$FROM_TAG' != eng/maestra/UPSTREAM_VERSION '$V'. Bump both (Renovate groups them)."
+            exit 1
+          fi
+          {
+            echo "upstream=$V"
+            echo "major=${V%%.*}"
+            echo "patches=$(cat eng/maestra/patches/*.patch 2>/dev/null | sha256sum | cut -c1-64)"  # empty = sha256 of nothing (e3b0c442...)
+          } >> "$GITHUB_OUTPUT"
+
+      # A patch that no longer applies to the upstream tag, or breaks its
+      # package tests, fails here.
+      - name: Apply patches and run their package tests
+        run: docker build -f eng/maestra/Dockerfile --target test .
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker build \
+            -f eng/maestra/Dockerfile \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.title=teleport-maestra" \
+            --label "org.opencontainers.image.vendor=maestra-io" \
+            --label "org.opencontainers.image.version=${{ steps.version.outputs.upstream }}" \
+            --label "io.maestra.upstream-revision=v${{ steps.version.outputs.upstream }}" \
+            --label "io.maestra.patches-sha256=${{ steps.version.outputs.patches }}" \
+            -t teleport-maestra:candidate \
+            .
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          GOT=$(docker run --rm --entrypoint /usr/local/bin/teleport teleport-maestra:candidate version --raw)
+          if [ "$GOT" != "${{ steps.version.outputs.upstream }}" ]; then
+            echo "::error::teleport version --raw printed '$GOT'"
+            exit 1
+          fi
+          docker run --rm --entrypoint /usr/local/bin/teleport teleport-maestra:candidate version
+
+      - name: Get Teleport version
+        id: tp-version
+        if: github.event_name != 'pull_request'
+        run: |
+          VERSION=$(curl -sf "https://${{ env.TELEPORT_FQDN }}/webapi/find" | jq -r '.auto_update.tools_version // .server_version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Failed to resolve Teleport version from /webapi/find"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Teleport binaries
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
+        with:
+          path: ${{ runner.tool_cache }}/teleport
+          key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Teleport
+        if: github.event_name != 'pull_request'
+        uses: teleport-actions/setup@10b5e9f760190f027a1e04e342178d8d6e7eae30  # v2
+        with:
+          version: ${{ steps.tp-version.outputs.version }}
+          proxy: ${{ env.TELEPORT_FQDN }}
+
+      - name: Public ECR login via Teleport Workload Identity
+        if: github.event_name != 'pull_request'
+        run: |
+          cat > /tmp/tbot.yaml << EOF_TBOT
+          version: v2
+          proxy_server: ${{ env.TELEPORT_FQDN }}
+          onboarding:
+            join_method: github
+            token: ${{ env.TELEPORT_TOKEN }}
+          oneshot: true
+          storage:
+            type: memory
+          services:
+            - type: workload-identity-jwt
+              destination:
+                type: directory
+                path: /tmp/tbot-output
+              selector:
+                name: image-push
+              audiences: ["sts.amazonaws.com"]
+          EOF_TBOT
+
+          mkdir -p /tmp/tbot-output
+
+          # tbot oneshot's heartbeat service sometimes exits on a transient
+          # "error reading from server: EOF" after the JWT was written: trust
+          # the JWT file, then prove it against STS before any push.
+          set +e
+          tbot start -c /tmp/tbot.yaml
+          TBOT_RC=$?
+          set -e
+          if [ ! -s /tmp/tbot-output/jwt_svid ]; then
+            echo "::error::tbot exited $TBOT_RC and did not write a JWT"
+            exit 1
+          fi
+
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/tbot-output/jwt_svid
+          export AWS_ROLE_ARN="${{ env.AWS_ROLE_ARN }}"
+          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
+          aws sts get-caller-identity > /dev/null
+
+          aws ecr-public get-login-password --region "${{ env.AWS_REGION }}" | \
+            docker login public.ecr.aws --username AWS --password-stdin
+
+          aws ecr-public describe-repositories --repository-names "${{ env.IMAGE_NAME }}" --region "${{ env.AWS_REGION }}" > /dev/null 2>&1 || \
+          aws ecr-public create-repository --repository-name "${{ env.IMAGE_NAME }}" --region "${{ env.AWS_REGION }}"
+
+      # ECR Public has no tag immutability: <version>-maestra.<run_number> is
+      # unique by convention only, and the major tag moves. Consumers (the
+      # fluxcd postRenderer on iota) pin by DIGEST.
+      - name: Push
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          IMAGE=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG="${{ steps.version.outputs.upstream }}-maestra.${{ github.run_number }}"
+          MAJOR="${{ steps.version.outputs.major }}"
+
+          # Push the image built and smoke-tested above; never rebuild here.
+          docker tag teleport-maestra:candidate "$IMAGE:$TAG"
+          docker tag teleport-maestra:candidate "$IMAGE:$MAJOR"
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:$MAJOR"
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG" | cut -d@ -f2)
+          {
+            echo "## Pushed ${IMAGE}"
+            echo ""
+            echo "| tag | |"
+            echo "|---|---|"
+            echo "| \`$TAG\` | unique by convention |"
+            echo "| \`$MAJOR\` | moving |"
+            echo ""
+            echo "Upstream \`v${{ steps.version.outputs.upstream }}\`, patches sha256 \`${{ steps.version.outputs.patches }}\`"
+            echo ""
+            echo "**Digest (pin this in fluxcd):** \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
