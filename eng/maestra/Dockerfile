@@ -62,5 +62,5 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 # Keep this tag equal to UPSTREAM_VERSION: build-and-push.yml fails otherwise,
 # and Renovate bumps both in one PR.
-FROM public.ecr.aws/gravitational/teleport-distroless:18.11.1@sha256:382550edf9ad16cb2e34561846b5968f1994daed62cb97ee9dd53c4f081bc3d3
+FROM public.ecr.aws/gravitational/teleport-distroless:18.11.6@sha256:5c8bfd3f23462b7983aea44f5c1637061d13d2ecf4e4b7e5690edb76ce597877
 COPY --from=build /out/teleport /usr/local/bin/teleport
