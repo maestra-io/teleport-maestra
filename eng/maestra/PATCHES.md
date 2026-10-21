@@ -21,9 +21,13 @@ silently on AWS S3. There is no automatic fallback on `NotImplemented`.
 
 Ceiling: upstream relies on bucket versioning to keep the first copy of a
 recording if it gets overwritten. With this flag, an overwrite (a second
-`CompleteMultipartUpload` for the same session) replaces the object. Protect
-against that with an R2 bucket lock rule, not in Teleport. Single-object uploads
-still use `If-None-Match: *`, and R2 honours it (412 on overwrite, verified live).
+`CompleteMultipartUpload` for the same session) replaces the object. Do not
+"fix" that with an R2 bucket lock: recordings and session summaries share the
+configured prefix, and Teleport must overwrite a pending summary with the final
+one, which a lock on the prefix would refuse. Single-object uploads (metadata,
+thumbnails) still use `If-None-Match: *`, and R2 honours it (412 on overwrite,
+verified live). A duplicate multipart completion for one session is a Teleport
+bug, not an attack surface here: the bucket is written only by auth.
 
 ## 0002 — fixed-size parts (no parameter)
 
@@ -58,8 +62,10 @@ Secret `session-records-r2-creds`, mounted as a volume):
 | `session_token` | no | omitted for static keys |
 | `expiration` | no | RFC3339; credentials expire 5 min before it, otherwise every 30 min |
 
-kubelet swaps a Secret volume atomically, and VSO rewrites the Secret at 67% of
-the TTL, so the cached creds always refresh before the old ones expire. The URI
+`Retrieve` resolves the mount's `..data` link once and reads every file from
+that directory, so one refresh never mixes two Secret generations. kubelet swaps
+that link atomically, and VSO rewrites the Secret at 67% of the TTL, so the
+cached creds always refresh before the old ones expire. The URI
 parameter takes precedence over External Audit Storage credentials and env vars.
 
 ## Resulting `audit_sessions_uri`
