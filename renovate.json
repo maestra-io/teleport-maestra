@@ -1,0 +1,42 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Teleport auth image. The upstream tag lives twice, in eng/maestra/UPSTREAM_VERSION (the source build) and in the teleport-distroless FROM (the stock base): one grouped PR bumps both, and build-and-push.yml fails when they differ. Run by the hosted Mend Renovate app, like eventrouter.",
+  "extends": [
+    "config:recommended",
+    ":disableDependencyDashboard",
+    ":semanticCommitsDisabled",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "labels": ["dependencies"],
+  "enabledManagers": ["dockerfile", "github-actions", "custom.regex"],
+  "pinDigests": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Upstream gravitational/teleport tag built from source.",
+      "managerFilePatterns": ["/^eng/maestra/UPSTREAM_VERSION$/"],
+      "matchStrings": ["(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "gravitational/teleport",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Source tag and stock base move together. Majors stay manual: a Teleport major is a cluster upgrade (auth first, one major at a time) and the patches may need porting.",
+      "matchPackageNames": [
+        "gravitational/teleport",
+        "public.ecr.aws/gravitational/teleport-distroless"
+      ],
+      "groupName": "teleport upstream",
+      "allowedVersions": "<19"
+    },
+    {
+      "description": "Stay on the Go line upstream releases with (the stock binary reports it in `teleport version`); a new Go minor is a deliberate bump.",
+      "matchPackageNames": ["golang"],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    }
+  ]
+}

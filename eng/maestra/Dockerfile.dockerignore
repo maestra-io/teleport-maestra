@@ -1,0 +1,5 @@
+# BuildKit reads this next to the Dockerfile. Upstream is cloned inside the
+# build; the context is only the version pin and our patches.
+*
+!eng/maestra/UPSTREAM_VERSION
+!eng/maestra/patches/
