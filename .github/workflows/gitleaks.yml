@@ -11,5 +11,5 @@ permissions:
 
 jobs:
   gitleaks:
-    uses: maestra-io/github-actions/.github/workflows/gitleaks.yml@main
+    uses: maestra-io/github-actions/.github/workflows/gitleaks.yml@300d87853c567cf7c83a14ba81373a9984b1d355 # main
     secrets: inherit
