@@ -1,0 +1,96 @@
+From: maestra-io
+Subject: [events] fixed-size non-trailing upload parts for S3-sized streams (R2)
+
+maestra-io/issues-maestra#1632. R2 rejects CompleteMultipartUpload with
+400 InvalidPart unless all non-trailing parts have the same length; Teleport
+cut parts at >= 5 MiB of variable size. Cut 256 KiB early, pad to exactly 5 MiB.
+Applied onto upstream gravitational/teleport v18.11.1 at build time by
+eng/maestra/Dockerfile, in file-name order. See eng/maestra/PATCHES.md.
+---
+diff --git a/lib/events/stream.go b/lib/events/stream.go
+index 900e7a68..051b7a2e 100644
+--- a/lib/events/stream.go
++++ b/lib/events/stream.go
+@@ -1143,10 +1143,22 @@ func (s *slice) Close() error {
+ 	return trace.Wrap(err)
+ }
+ 
++// fixedPartReserve is how far below MinUploadBytes an S3-sized slice is cut so
++// that the closed slice never exceeds MinUploadBytes and reader() pads every
++// non-last part to exactly MinUploadBytes. Cloudflare R2 rejects
++// CompleteMultipartUpload unless all non-trailing parts have the same length.
++// Bound: one event (<=64KiB) + unflushed gzip window (64KiB) + age chunk
++// (64KiB) + block/trailer overhead. maestra patch.
++const fixedPartReserve = 256 * 1024
++
+ // shouldUpload returns true if it's time to write the slice
+ // (set to true when it has reached the min slice in bytes)
+ func (s *slice) shouldUpload() bool {
+-	return int64(s.buffer.Len()) >= s.proto.cfg.MinUploadBytes
++	threshold := s.proto.cfg.MinUploadBytes
++	if threshold >= MinUploadPartSizeBytes {
++		threshold -= fixedPartReserve
++	}
++	return int64(s.buffer.Len()) >= threshold
+ }
+ 
+ // isEmpty returns true if the slice hasn't had any events written to
+diff --git a/lib/events/stream_test.go b/lib/events/stream_test.go
+index d1ba4d53..3fa4435a 100644
+--- a/lib/events/stream_test.go
++++ b/lib/events/stream_test.go
+@@ -21,6 +21,7 @@ package events_test
+ import (
+ 	"bytes"
+ 	"context"
++	"crypto/rand"
+ 	"encoding/hex"
+ 	"errors"
+ 	"io"
+@@ -1161,3 +1162,46 @@ func TestRecordingMetadataProcessing(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestFixedSizeParts verifies that an S3-sized stream uploads non-trailing parts
++// of exactly MinUploadPartSizeBytes even for incompressible data, as Cloudflare
++// R2 requires. maestra patch.
++func TestFixedSizeParts(t *testing.T) {
++	ctx := t.Context()
++	uploader := eventstest.NewMemoryUploader()
++	streamer, err := events.NewProtoStreamer(events.ProtoStreamerConfig{Uploader: uploader})
++	require.NoError(t, err)
++
++	sid := session.NewID()
++	stream, err := streamer.CreateAuditStream(ctx, sid)
++	require.NoError(t, err)
++
++	const eventCount = 800 // ~19 MiB of random bytes, 4+ parts
++	for i := range eventCount {
++		data := make([]byte, 1+i*977%(48*1024))
++		rand.Read(data)
++		event := &apievents.SessionPrint{
++			Metadata: apievents.Metadata{Type: events.SessionPrintEvent, Index: int64(i)},
++			Data:     data,
++		}
++		require.NoError(t, stream.RecordEvent(ctx, eventstest.PrepareEvent(event)))
++	}
++	require.NoError(t, stream.Complete(ctx))
++
++	uploads, err := uploader.ListUploads(ctx)
++	require.NoError(t, err)
++	require.Len(t, uploads, 1)
++	parts, err := uploader.GetParts(uploads[0].ID)
++	require.NoError(t, err)
++	require.GreaterOrEqual(t, len(parts), 4)
++	for i, part := range parts[:len(parts)-1] {
++		require.Len(t, part, events.MinUploadPartSizeBytes, "part %d", i+1)
++	}
++	require.LessOrEqual(t, len(parts[len(parts)-1]), events.MinUploadPartSizeBytes)
++
++	var buf bytes.Buffer
++	require.NoError(t, uploader.Download(ctx, sid, &buf))
++	read, err := events.NewProtoReader(&buf, nil).ReadAll(ctx)
++	require.NoError(t, err)
++	require.Len(t, read, eventCount)
++}
