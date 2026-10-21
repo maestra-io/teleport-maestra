@@ -1,0 +1,111 @@
+From: maestra-io
+Subject: [S3 sessions] disable_versioning: read the current object, skip ListObjectVersions (R2)
+
+maestra-io/issues-maestra#1632. Cloudflare R2 answers ListObjectVersions with
+501 NotImplemented, which broke every Download/DownloadMetadata/
+DownloadThumbnail and the upload completer's session-end recovery.
+Applied onto upstream gravitational/teleport v18.11.1 at build time by
+eng/maestra/Dockerfile, in file-name order. See eng/maestra/PATCHES.md.
+---
+diff --git a/lib/events/s3sessions/s3handler.go b/lib/events/s3sessions/s3handler.go
+index 3139e5e1..cdea7655 100644
+--- a/lib/events/s3sessions/s3handler.go
++++ b/lib/events/s3sessions/s3handler.go
+@@ -66,6 +66,9 @@ var s3AllowedACL = map[string]struct{}{
+ 	"log-delivery-write":        {},
+ }
+ 
++// disableVersioningParam is the audit_sessions_uri flag for Config.DisableVersioning.
++const disableVersioningParam = "disable_versioning"
++
+ func isCannedACL(acl string) bool {
+ 	_, ok := s3AllowedACL[acl]
+ 	return ok
+@@ -99,6 +102,9 @@ type Config struct {
+ 	Insecure bool
+ 	// DisableServerSideEncryption is an optional switch to opt out of SSE in case the provider does not support it
+ 	DisableServerSideEncryption bool
++	// DisableVersioning reads the current object instead of the oldest version,
++	// for providers without ListObjectVersions (Cloudflare R2). maestra patch.
++	DisableVersioning bool
+ 
+ 	// UseVirtualStyleAddressing use a virtual-hosted–style URI.
+ 	// Path style e.g. https://s3.region-code.amazonaws.com/bucket-name/key-name
+@@ -140,6 +146,13 @@ func (s *Config) SetFromURL(in *url.URL, inRegion string) error {
+ 		}
+ 		s.DisableServerSideEncryption = disableServerSideEncryption
+ 	}
++	if val := in.Query().Get(disableVersioningParam); val != "" {
++		disableVersioning, err := strconv.ParseBool(val)
++		if err != nil {
++			return trace.BadParameter(boolErrorTemplate, in.String(), disableVersioningParam, val)
++		}
++		s.DisableVersioning = disableVersioning
++	}
+ 	if acl := in.Query().Get(teleport.ACL); acl != "" {
+ 		if !isCannedACL(acl) {
+ 			return trace.BadParameter("failed to parse URI %q flag %q - %q is not a valid canned ACL", in.String(), teleport.ACL, acl)
+@@ -471,6 +484,11 @@ func (h *Handler) DownloadThumbnail(ctx context.Context, sessionID session.ID, w
+ }
+ 
+ func (h *Handler) downloadOriginalFile(ctx context.Context, path string, writer io.Writer) error {
++	if h.DisableVersioning {
++		// No version history: the current object is the only one. Overwrites of
++		// recordings are then prevented by bucket policy, not by versioning.
++		return trace.Wrap(h.downloadFile(ctx, path, writer, nil /* versionID */))
++	}
+ 	// Get the oldest version of this object. This has to be done because S3
+ 	// allows overwriting objects in a bucket. To prevent corruption of recording
+ 	// data, get all versions and always return the first.
+diff --git a/lib/events/s3sessions/s3handler_config_test.go b/lib/events/s3sessions/s3handler_config_test.go
+index f11c3c2a..9b4aaa71 100644
+--- a/lib/events/s3sessions/s3handler_config_test.go
++++ b/lib/events/s3sessions/s3handler_config_test.go
+@@ -54,7 +54,7 @@ func TestConfig_SetFromURL(t *testing.T) {
+ 	}{
+ 		{
+ 			name: "fips enabled via url",
+-			url:  "s3://bucket/audit?insecure=true&disablesse=true&acl=private&use_fips_endpoint=true&sse_kms_key=abcdefg",
++			url:  "s3://bucket/audit?insecure=true&disablesse=true&acl=private&use_fips_endpoint=true&sse_kms_key=abcdefg&disable_versioning=true",
+ 			cfgAssertion: func(t *testing.T, config Config) {
+ 
+ 				var (
+@@ -70,6 +70,7 @@ func TestConfig_SetFromURL(t *testing.T) {
+ 				require.Equal(t, types.ClusterAuditConfigSpecV2_FIPS_ENABLED, config.UseFIPSEndpoint)
+ 				require.True(t, config.Insecure)
+ 				require.True(t, config.DisableServerSideEncryption)
++				require.True(t, config.DisableVersioning)
+ 			},
+ 		},
+ 		{
+@@ -87,6 +88,7 @@ func TestConfig_SetFromURL(t *testing.T) {
+ 
+ 				require.False(t, config.Insecure)
+ 				require.False(t, config.DisableServerSideEncryption)
++				require.False(t, config.DisableVersioning)
+ 
+ 				require.Equal(t, types.ClusterAuditConfigSpecV2_FIPS_DISABLED, config.UseFIPSEndpoint)
+ 			},
+diff --git a/lib/events/s3sessions/s3handler_thirdparty_test.go b/lib/events/s3sessions/s3handler_thirdparty_test.go
+index a3882121..fe75222e 100644
+--- a/lib/events/s3sessions/s3handler_thirdparty_test.go
++++ b/lib/events/s3sessions/s3handler_thirdparty_test.go
+@@ -100,4 +100,18 @@ func TestThirdpartyStreams(t *testing.T) {
+ 	t.Run("DownloadNotFound", func(t *testing.T) {
+ 		test.DownloadNotFound(t, handler)
+ 	})
++	t.Run("DisableVersioning", func(t *testing.T) {
++		h := *handler
++		h.DisableVersioning = true
++		h.client = noVersionsClient{h.client}
++		test.UploadDownload(t, &h)
++		test.DownloadNotFound(t, &h)
++	})
++}
++
++// noVersionsClient fails ListObjectVersions like Cloudflare R2 (501 NotImplemented).
++type noVersionsClient struct{ s3Client }
++
++func (noVersionsClient) ListObjectVersions(context.Context, *s3.ListObjectVersionsInput, ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
++	return nil, trace.NotImplemented("ListObjectVersions")
+ }
