@@ -40,7 +40,11 @@ RUN --mount=type=bind,source=eng/maestra,target=/maestra \
 ENV CGO_ENABLED=1 \
     GOFLAGS=-buildvcs=false \
     TAGS="pam kustomize_disable_go_plugin_support"
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# proxy.golang.org drops HTTP/2 streams under the ~1k-module fan-out
+# (INTERNAL_ERROR on 4 of them, 2026-10-21 run 39603291663); the cache mount
+# keeps what landed, so a retry only fetches the rest.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    for i in 1 2 3; do go mod download && break; [ "$i" = 3 ] && exit 1; sleep 10; done
 
 FROM src AS test
 # Packages the patches touch; override with --build-arg TEST_PACKAGES=...
